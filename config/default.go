@@ -13,7 +13,7 @@ title = "gitleaks config"
 
 [[rules]]
 	description = "AWS Secret Key"
-	regex = '''(?i)aws(.{0,20})?(?-i)[0-9a-zA-Z\/+]{40}'''
+	regex = '''(?i)aws(.{0,20})?(?-i)['\"][0-9a-zA-Z\/+]{40}['\"]'''
 	tags = ["key", "AWS"]
 
 [[rules]]
@@ -23,12 +23,12 @@ title = "gitleaks config"
 
 [[rules]]
 	description = "Facebook Secret Key"
-	regex = '''(?i)(facebook|fb)(.{0,20})?(?-i)[0-9a-f]{32}'''
+	regex = '''(?i)(facebook|fb)(.{0,20})?(?-i)['\"][0-9a-f]{32}['\"]'''
 	tags = ["key", "Facebook"]
 
 [[rules]]
 	description = "Facebook Client ID"
-	regex = '''(?i)(facebook|fb)(.{0,20})?[0-9]{13,17}'''
+	regex = '''(?i)(facebook|fb)(.{0,20})?['\"][0-9]{13,17}['\"]'''
 	tags = ["key", "Facebook"]
 
 [[rules]]
@@ -65,11 +65,6 @@ title = "gitleaks config"
 	description = "Asymmetric Private Key"
 	regex = '''-----BEGIN ((EC|PGP|DSA|RSA|OPENSSH) )?PRIVATE KEY( BLOCK)?-----'''
 	tags = ["key", "AsymmetricPrivateKey"]
-
-[[rules]]
-	description = "Generic Credential"
-	regex = '''(?i)(api_key|apikey|secret|password|pass|pw|key)(.{0,20})?[0-9a-zA-Z]{16,45}'''
-	tags = ["key", "API", "generic"]
 
 [[rules]]
 	description = "Google API key"
@@ -136,7 +131,9 @@ title = "gitleaks config"
 	regex = '''(?i)twilio(.{0,20})?SK[0-9a-f]{32}'''
 	tags = ["key", "twilio"]
 
-[whitelist]
-	description = "Whitelisted files"
-	file = '''(^\.?gitleaks.toml$|(.*?)(jpg|gif|doc|pdf|bin)$)'''
+[allowlist]
+	description = "Allowlisted files"
+	files = ['''^\.?gitleaks.toml$''',
+	'''(.*?)(jpg|gif|doc|pdf|bin)$''',
+	'''(go.mod|go.sum)$''']
 `

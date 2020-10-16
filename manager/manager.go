@@ -2,24 +2,24 @@ package manager
 
 import (
 	"crypto/sha1"
-	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"sync"
 	"text/tabwriter"
 	"time"
 
-	"github.com/zricethezav/gitleaks/v4/config"
-	"github.com/zricethezav/gitleaks/v4/options"
+	"github.com/zricethezav/gitleaks/v6/config"
+	"github.com/zricethezav/gitleaks/v6/options"
 
+	"github.com/go-git/go-git/v5"
 	"github.com/hako/durafmt"
 	"github.com/mattn/go-colorable"
 	log "github.com/sirupsen/logrus"
-	"gopkg.in/src-d/go-git.v4"
 )
 
 const maxLineLen = 200
@@ -47,6 +47,7 @@ type Manager struct {
 // sensitive information as determined by the rules set in a gitleaks config
 type Leak struct {
 	Line       string    `json:"line"`
+	LineNumber int       `json:"lineNumber"`
 	Offender   string    `json:"offender"`
 	Commit     string    `json:"commit"`
 	Repo       string    `json:"repo"`
@@ -57,13 +58,14 @@ type Leak struct {
 	File       string    `json:"file"`
 	Date       time.Time `json:"date"`
 	Tags       string    `json:"tags"`
+	Operation  string    `json:"operation"`
 	lookupHash string
 }
 
-// AuditTime is a type used to determine total audit time
-type AuditTime int64
+// ScanTime is a type used to determine total scan time
+type ScanTime int64
 
-// PatchTime is a type used to determine total patch time during an audit
+// PatchTime is a type used to determine total patch time during an scan
 type PatchTime int64
 
 // CloneTime is a type used to determine total clone time
@@ -77,7 +79,7 @@ type RegexTime struct {
 	Regex string
 }
 
-// Metadata is a struct used to communicate metadata about an audit like timings and total commit counts.
+// Metadata is a struct used to communicate metadata about an scan like timings and total commit counts.
 type Metadata struct {
 	mux  *sync.Mutex
 	data map[string]interface{}
@@ -86,7 +88,7 @@ type Metadata struct {
 
 	RegexTime map[string]int64
 	Commits   int
-	AuditTime int64
+	ScanTime  int64
 	patchTime int64
 	cloneTime int64
 }
@@ -146,7 +148,7 @@ func (manager *Manager) GetLeaks() []Leak {
 	return manager.leaks
 }
 
-// SendLeaks accepts a leak and is used by the audit pkg. This is the public function
+// SendLeaks accepts a leak and is used by the scan pkg. This is the public function
 // that allows other packages to send leaks to the manager.
 func (manager *Manager) SendLeaks(l Leak) {
 	if len(l.Line) > maxLineLen {
@@ -156,8 +158,12 @@ func (manager *Manager) SendLeaks(l Leak) {
 		l.Offender = l.Offender[0:maxLineLen-1] + "..."
 	}
 	h := sha1.New()
-	h.Write([]byte(l.Commit + l.Offender + l.File + l.Line))
+	h.Write([]byte(l.Commit + l.Offender + l.File + l.Line + string(l.LineNumber)))
 	l.lookupHash = hex.EncodeToString(h.Sum(nil))
+	if manager.Opts.Redact {
+		l.Line = strings.ReplaceAll(l.Line, l.Offender, "REDACTED")
+		l.Offender = "REDACTED"
+	}
 	manager.leakWG.Add(1)
 	manager.leakChan <- l
 }
@@ -207,8 +213,8 @@ func (manager *Manager) receiveMetadata() {
 		switch ti := t.(type) {
 		case CloneTime:
 			manager.metadata.cloneTime += int64(ti)
-		case AuditTime:
-			manager.metadata.AuditTime += int64(ti)
+		case ScanTime:
+			manager.metadata.ScanTime += int64(ti)
 		case PatchTime:
 			manager.metadata.patchTime += int64(ti)
 		case RegexTime:
@@ -218,7 +224,7 @@ func (manager *Manager) receiveMetadata() {
 	}
 }
 
-// IncrementCommits increments total commits during an audit by i.
+// IncrementCommits increments total commits during an scan by i.
 func (manager *Manager) IncrementCommits(i int) {
 	manager.metadata.mux.Lock()
 	manager.metadata.Commits += i
@@ -231,12 +237,12 @@ func (manager *Manager) RecordTime(t interface{}) {
 	manager.metadata.timings <- t
 }
 
-// DebugOutput logs metadata and other messages that occurred during a gitleaks audit
+// DebugOutput logs metadata and other messages that occurred during a gitleaks scan
 func (manager *Manager) DebugOutput() {
 	log.Debugf("-------------------------\n")
 	log.Debugf("| Times and Commit Counts|\n")
 	log.Debugf("-------------------------\n")
-	fmt.Println("totalAuditTime: ", durafmt.Parse(time.Duration(manager.metadata.AuditTime)*time.Nanosecond))
+	fmt.Println("totalScanTime: ", durafmt.Parse(time.Duration(manager.metadata.ScanTime)*time.Nanosecond))
 	fmt.Println("totalPatchTime: ", durafmt.Parse(time.Duration(manager.metadata.patchTime)*time.Nanosecond))
 	fmt.Println("totalCloneTime: ", durafmt.Parse(time.Duration(manager.metadata.cloneTime)*time.Nanosecond))
 	fmt.Println("totalCommits: ", manager.metadata.Commits)
@@ -245,7 +251,7 @@ func (manager *Manager) DebugOutput() {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, padding, '.', 0)
 
 	log.Debugf("--------------------------\n")
-	log.Debugf("| Individual Regex Times |\n")
+	log.Debugf("| Individual Regexes Times |\n")
 	log.Debugf("--------------------------\n")
 	for k, v := range manager.metadata.RegexTime {
 		_, _ = fmt.Fprintf(w, "%s\t%s\n", k, durafmt.Parse(time.Duration(v)*time.Nanosecond))
@@ -254,46 +260,6 @@ func (manager *Manager) DebugOutput() {
 
 }
 
-// Report saves gitleaks leaks to a json specified by --report={report.json}
-func (manager *Manager) Report() error {
-	close(manager.leakChan)
-	close(manager.metadata.timings)
-
-	if log.IsLevelEnabled(log.DebugLevel) {
-		manager.DebugOutput()
-	}
-
-	if manager.Opts.Report != "" {
-		if len(manager.GetLeaks()) == 0 {
-			log.Infof("no leaks found, skipping writing report")
-			return nil
-		}
-		file, err := os.Create(manager.Opts.Report)
-		if err != nil {
-			return err
-		}
-
-		if manager.Opts.ReportFormat == "json" {
-			encoder := json.NewEncoder(file)
-			encoder.SetIndent("", " ")
-			err = encoder.Encode(manager.leaks)
-			if err != nil {
-				return err
-			}
-		} else {
-			w := csv.NewWriter(file)
-			_ = w.Write([]string{"repo", "line", "commit", "offender", "rule", "tags", "commitMsg", "author", "email", "file", "date"})
-			for _, leak := range manager.GetLeaks() {
-				w.Write([]string{leak.Repo, leak.Line, leak.Commit, leak.Offender, leak.Rule, leak.Tags, leak.Message, leak.Author, leak.Email, leak.File, leak.Date.Format(time.RFC3339)})
-			}
-			w.Flush()
-		}
-		_ = file.Close()
-
-		log.Infof("report written to %s", manager.Opts.Report)
-	}
-	return nil
-}
 
 func (manager *Manager) receiveInterrupt() {
 	<-manager.stopChan
@@ -303,6 +269,6 @@ func (manager *Manager) receiveInterrupt() {
 			log.Error(err)
 		}
 	}
-	log.Info("gitleaks received interrupt, stopping audit")
+	log.Info("gitleaks received interrupt, stopping scan")
 	os.Exit(options.ErrorEncountered)
 }
